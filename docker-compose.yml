@@ -1,0 +1,202 @@
+# =============================================================================
+# DOCKER COMPOSE — TOGGLEMASTER (FASE 2)
+# =============================================================================
+name: togglemaster
+
+# =============================================================================
+# SERVICES — POSTGRES, REDIS, LOCALSTACK, 5 WORKLOADS
+# =============================================================================
+services:
+  # ---------------------------------------------------------------------------
+  # POSTGRES
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:14.23-alpine3.23
+    container_name: tm-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/local/init_postgres.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
+      - ./apps/auth-service/db/init.sql:/init/auth-init.sql:ro
+      - ./apps/flag-service/db/init.sql:/init/flag-init.sql:ro
+      - ./apps/targeting-service/db/init.sql:/init/targeting-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  # ---------------------------------------------------------------------------
+  # REDIS
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:alpine3.23
+    container_name: tm-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # LOCALSTACK
+  # ---------------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: tm-localstack
+    restart: unless-stopped
+    environment:
+      - SERVICES=sqs,dynamodb
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/local/init_localstack.sh:/etc/localstack/init/ready.d/init.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"dynamodb\": \"running\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # WORKLOAD: AUTH-SERVICE
+  # ---------------------------------------------------------------------------
+  auth-service:
+    build: ./apps/auth-service
+    container_name: tm-auth-service
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://user:pass@postgres:5432/auth_db
+      - MASTER_KEY=local-master-key
+      - PORT=8001
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # WORKLOAD: FLAG-SERVICE
+  # ---------------------------------------------------------------------------
+  flag-service:
+    build: ./apps/flag-service
+    container_name: tm-flag-service
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://user:pass@postgres:5432/flags_db
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - PORT=8002
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # WORKLOAD: TARGETING-SERVICE
+  # ---------------------------------------------------------------------------
+  targeting-service:
+    build: ./apps/targeting-service
+    container_name: tm-targeting-service
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://user:pass@postgres:5432/targeting_db
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - PORT=8003
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8003/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # WORKLOAD: EVALUATION-SERVICE
+  # ---------------------------------------------------------------------------
+  evaluation-service:
+    build: ./apps/evaluation-service
+    container_name: tm-evaluation-service
+    restart: unless-stopped
+    environment:
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+      - REDIS_URL=redis://redis:6379
+      - FLAG_SERVICE_URL=http://flag-service:8002
+      - TARGETING_SERVICE_URL=http://targeting-service:8003
+      - AWS_SQS_URL=http://localstack:4566/000000000000/togglemaster-events
+      - AWS_SQS_ENDPOINT=http://localstack:4566
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_REGION=us-east-1
+      - PORT=8004
+    ports:
+      - "8004:8004"
+    depends_on:
+      redis:
+        condition: service_healthy
+      flag-service:
+        condition: service_healthy
+      targeting-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8004/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # WORKLOAD: ANALYTICS-SERVICE
+  # ---------------------------------------------------------------------------
+  analytics-service:
+    build: ./apps/analytics-service
+    container_name: tm-analytics-service
+    restart: unless-stopped
+    environment:
+      - AWS_DYNAMODB_TABLE=ToggleMasterAnalytics
+      - AWS_SQS_URL=http://localstack:4566/000000000000/togglemaster-events
+      - AWS_SQS_ENDPOINT=http://localstack:4566
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_REGION=us-east-1
+      - PORT=8005
+    ports:
+      - "8005:8005"
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8005/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# =============================================================================
+# VOLUMES — POSTGRES, LOCALSTACK
+# =============================================================================
+volumes:
+  postgres_data:
+  localstack_data:
